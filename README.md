@@ -111,7 +111,9 @@ TCP and UDP tests search at most 256 deterministic tuples for an initial upper-t
 
 Reverse flowlets run on s4 while established forward state on s1 remains unchanged. Transit switches are checked for untouched registers. A protocol-only tuple difference tests independent TCP/UDP state: one flow times out while keepalive packets retain the other's flowlet. A bounded search of at most 4097 tuples finds a slot collision with distinct fingerprints. Alternating residents after nonzero flowlet IDs verifies fresh timestamps, ID 0, and independently selected paths on eviction; other slots remain untouched.
 
-The suite also covers ordinary forward/reverse routing, both static branches, IPv4 validation and route-miss drops, ping, live verification, and cleanup after successful operation or controller failure. `make clean` removes build products and local Python caches.
+Bypass and drop tests run in both directions with empty and populated state, comparing all five arrays on all four switches. ICMP, other IPv4 protocols, and TCP/UDP first and non-first fragments must preserve state. Invalid IPv4 checksums, TTL expiry, unsupported IHL, route misses, truncated headers, and inconsistent IPv4/TCP/UDP lengths must drop without changing state. Captures also verify TCP options and binary payloads; fragmented transport checksums are checked after reassembly.
+
+The suite also covers ordinary forward/reverse routing, both static branches, ping, live verification, and cleanup after successful operation or controller failure. `make clean` removes build products and local Python caches.
 
 This is a reference implementation, not a production fabric load balancer. State is bounded, direct-mapped, and subject to eviction and fingerprint aliases. This is not congestion-aware load balancing: path selection has no queue, utilization, failure, or ordering feedback. A time gap alone does not guarantee that packets from successive flowlets cannot reorder in a congested network.
 
