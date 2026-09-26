@@ -99,8 +99,9 @@ class BMv2Switch(Switch):
 
 
 class Diamond:
-    def __init__(self, pipeline=None):
+    def __init__(self, pipeline=None, timeout_us=500000):
         self.pipeline = Path(pipeline) if pipeline else ROOT / "build/flowlet.json"
+        self.timeout_us = timeout_us
         self.net = None
         self.directory = None
         self.runtime = None
@@ -158,7 +159,8 @@ class Diamond:
     def configure(self, device, verify_only=False, static_path=0):
         command = [str(ROOT / "build/controller"), "--device", str(device),
                    "--p4info", str(ROOT / "build/flowlet.p4info.txtpb"),
-                   "--pipeline", str(self.pipeline), "--static-path", str(static_path)]
+                   "--pipeline", str(self.pipeline), "--static-path", str(static_path),
+                   "--timeout-us", str(self.timeout_us)]
         if verify_only:
             command.append("--verify-only")
         result = subprocess.run(command, cwd=self.runtime, capture_output=True, text=True,

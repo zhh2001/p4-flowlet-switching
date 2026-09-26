@@ -49,14 +49,24 @@ class Capture:
         # A bounded observation window also detects duplicates and unexpected output.
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
-            ready, _, _ = select.select(list(self.sockets), [], [],
-                                        max(0, deadline - time.monotonic()))
-            for sock in ready:
-                raw, address = sock.recvfrom(65535)
-                name, outgoing = self.sockets[sock]
-                if (address[2] == socket.PACKET_OUTGOING) == outgoing:
-                    self.packets[name].append(Ether(raw))
+            self._receive(max(0, deadline - time.monotonic()))
         return self.packets
+
+    def _receive(self, timeout):
+        ready, _, _ = select.select(list(self.sockets), [], [], timeout)
+        for sock in ready:
+            raw, address = sock.recvfrom(65535)
+            name, outgoing = self.sockets[sock]
+            if (address[2] == socket.PACKET_OUTGOING) == outgoing:
+                self.packets[name].append(Ether(raw))
+
+    def wait_for(self, token, location="destination", timeout=1):
+        deadline = time.monotonic() + timeout
+        while not any(token in bytes(packet) for packet in self.packets[location]):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"packet not observed at {location}: {token!r}")
+            self._receive(remaining)
 
     def __enter__(self):
         return self

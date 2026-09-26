@@ -18,6 +18,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const defaultTimeoutUS uint64 = 500000
+
 type route struct {
 	destination string
 	port        uint64
@@ -55,30 +57,69 @@ func routes(device, path int) ([]route, error) {
 	return out, nil
 }
 
-func entries(p *pipeline.Pipeline, device, path int) ([]*p4v1.TableEntry, error) {
+func entries(p *pipeline.Pipeline, device, path int, timeoutUS uint64) ([]*p4v1.TableEntry, error) {
 	routes, err := routes(device, path)
 	if err != nil {
 		return nil, err
 	}
-	var out []*p4v1.TableEntry
+	if timeoutUS == 0 || timeoutUS >= 1<<48 {
+		return nil, fmt.Errorf("timeout must be in 1..2^48-1 microseconds")
+	}
+	builders := []*tableentry.Builder{
+		tableentry.NewBuilder(p, "IngressPipe.flowlet_config").AsDefault().
+			Action("IngressPipe.set_timeout_us", tableentry.Param("value", codec.MustEncodeUint(timeoutUS, 48))),
+	}
+	if device == 1 || device == 4 {
+		peerPort := 1
+		if device == 4 {
+			peerPort = 2
+		}
+		for branch := 0; branch < 2; branch++ {
+			builders = append(builders, tableentry.NewBuilder(p, "IngressPipe.flowlet_path").
+				Match("meta.selected_path", tableentry.Exact(codec.MustEncodeUint(uint64(branch), 1))).
+				Action("IngressPipe.set_nhop",
+					tableentry.Param("port", codec.MustEncodeUint(uint64(branch+2), 9)),
+					tableentry.Param("src_mac", codec.MustMAC(switchMAC(device, branch+2))),
+					tableentry.Param("dst_mac", codec.MustMAC(switchMAC(branch+2, peerPort)))))
+		}
+	}
 	for _, route := range routes {
-		entry, err := tableentry.NewBuilder(p, "IngressPipe.ipv4_route").
-			Match("hdr.ipv4.dst_addr", tableentry.LPM(codec.MustIPv4(route.destination), 32)).
-			Action("IngressPipe.set_nhop",
+		builder := tableentry.NewBuilder(p, "IngressPipe.ipv4_route").
+			Match("hdr.ipv4.dst_addr", tableentry.LPM(codec.MustIPv4(route.destination), 32))
+		if (device == 1 || device == 4) && route.port != 1 {
+			builder.Action("IngressPipe.select_flowlet",
+				tableentry.Param("default_path", codec.MustEncodeUint(uint64(path), 1)))
+		} else {
+			builder.Action("IngressPipe.set_nhop",
 				tableentry.Param("port", codec.MustEncodeUint(route.port, 9)),
 				tableentry.Param("src_mac", codec.MustMAC(route.sourceMAC)),
-				tableentry.Param("dst_mac", codec.MustMAC(route.nextMAC))).Build()
+				tableentry.Param("dst_mac", codec.MustMAC(route.nextMAC)))
+		}
+		builders = append(builders, builder)
+	}
+	for _, table := range []string{"IngressPipe.ipv4_route", "IngressPipe.flowlet_path"} {
+		builders = append(builders, tableentry.NewBuilder(p, table).AsDefault().Action("IngressPipe.drop"))
+	}
+	var out []*p4v1.TableEntry
+	for _, builder := range builders {
+		entry, err := builder.Build()
 		if err != nil {
 			return nil, err
 		}
+		// SDK v1.1.1 emits empty bytes for zero; P4Runtime requires one zero byte.
+		for _, match := range entry.Match {
+			if exact := match.GetExact(); exact != nil && len(exact.Value) == 0 {
+				exact.Value = []byte{0}
+			}
+		}
+		for _, param := range entry.GetAction().GetAction().Params {
+			if len(param.Value) == 0 {
+				param.Value = []byte{0}
+			}
+		}
 		out = append(out, entry)
 	}
-	entry, err := tableentry.NewBuilder(p, "IngressPipe.ipv4_route").
-		AsDefault().Action("IngressPipe.drop").Build()
-	if err != nil {
-		return nil, err
-	}
-	return append(out, entry), nil
+	return out, nil
 }
 
 // P4Runtime permits both padded and shortest-form bytestrings for unsigned fields.
@@ -91,6 +132,9 @@ func canonicalEntry(entry *p4v1.TableEntry) *p4v1.TableEntry {
 		return b
 	}
 	for _, match := range out.Match {
+		if exact := match.GetExact(); exact != nil {
+			exact.Value = trim(exact.Value)
+		}
 		if lpm := match.GetLpm(); lpm != nil {
 			lpm.Value = trim(lpm.Value)
 		}
@@ -134,8 +178,8 @@ type switchAPI interface {
 	Read(context.Context, ...*p4v1.Entity) ([]*p4v1.Entity, error)
 }
 
-func configure(ctx context.Context, c switchAPI, p *pipeline.Pipeline, device, path int, verifyOnly bool) error {
-	want, err := entries(p, device, path)
+func configure(ctx context.Context, c switchAPI, p *pipeline.Pipeline, device, path int, timeoutUS uint64, verifyOnly bool) error {
+	want, err := entries(p, device, path, timeoutUS)
 	if err != nil {
 		return err
 	}
@@ -147,10 +191,16 @@ func configure(ctx context.Context, c switchAPI, p *pipeline.Pipeline, device, p
 			return err
 		}
 		for _, entry := range want {
-			if !entry.IsDefaultAction {
-				if err := c.WriteTableEntry(ctx, client.UpdateInsert, entry); err != nil {
-					return err
+			kind := client.UpdateInsert
+			if entry.IsDefaultAction {
+				table, _ := p.TableByID(entry.TableId)
+				if table.Raw().ConstDefaultActionId != 0 {
+					continue
 				}
+				kind = client.UpdateModify
+			}
+			if err := c.WriteTableEntry(ctx, kind, entry); err != nil {
+				return err
 			}
 		}
 	}
@@ -188,7 +238,8 @@ func configure(ctx context.Context, c switchAPI, p *pipeline.Pipeline, device, p
 
 func run() error {
 	device := flag.Int("device", 0, "diamond switch ID (1..4)")
-	path := flag.Int("static-path", 0, "static branch: 0=upper, 1=lower")
+	path := flag.Int("static-path", 0, "bypass branch: 0=upper, 1=lower")
+	timeoutUS := flag.Uint64("timeout-us", defaultTimeoutUS, "flowlet timeout in microseconds")
 	address := flag.String("address", "", "P4Runtime address (default 127.0.0.1:50050+device)")
 	infoPath := flag.String("p4info", "build/flowlet.p4info.txtpb", "P4Info text file")
 	jsonPath := flag.String("pipeline", "build/flowlet.json", "BMv2 pipeline JSON")
@@ -227,10 +278,10 @@ func run() error {
 	if err := c.BecomePrimary(ctx); err != nil {
 		return err
 	}
-	if err := configure(ctx, c, p, *device, *path, *verifyOnly); err != nil {
+	if err := configure(ctx, c, p, *device, *path, *timeoutUS, *verifyOnly); err != nil {
 		return fmt.Errorf("s%d: %w", *device, err)
 	}
-	fmt.Printf("s%d: pipeline and routes verified\n", *device)
+	fmt.Printf("s%d: pipeline, routes, paths, and timeout verified\n", *device)
 	return nil
 }
 

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import socket
 import sys
+import time
 import unittest
 
 from scapy.all import Ether, ICMP, IP, Raw, TCP, UDP
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ROOT / "mininet"))
 from diamond import Diamond, INTERFACES, PORTS, mac, checked
 from mininet.log import setLogLevel
 from packets import Capture, packet_socket
+from state import Flow, Registers, TIMESTAMP_MASK, path_change_flow
 
 
 def assert_clean(test, diamond):
@@ -80,6 +82,9 @@ class ForwardingTests(unittest.TestCase):
         original = Ether(src=mac(source, 0), dst=mac(edge, 1)) / IP(
             src=source_ip, dst=destination_ip, ttl=64, id=73) / transport / Raw(token)
         original = Ether(bytes(original))
+        if TCP in original or UDP in original:
+            lower = bool(Flow(source_ip, destination_ip, original[IP].proto,
+                              transport.sport, transport.dport).path(0))
         branch_port = 1 if reverse else 2
         interfaces = {
             "upper": (f"{edge}-eth2", None),
@@ -91,6 +96,12 @@ class ForwardingTests(unittest.TestCase):
         with Capture(interfaces) as capture, packet_socket(f"{source}-eth0", net[source]) as sender:
             sender.send(bytes(original))
             captured = capture.collect()
+        self.assert_path(original, token, captured, reverse, lower)
+
+    def assert_path(self, original, token, captured, reverse=False, lower=False):
+        destination = "h1" if reverse else "h2"
+        edge, far = ("s4", "s1") if reverse else ("s1", "s4")
+        branch_port = 1 if reverse else 2
         matching = {name: [p for p in packets if token in bytes(p)]
                     for name, packets in captured.items()}
         chosen = "lower" if lower else "upper"
@@ -109,14 +120,14 @@ class ForwardingTests(unittest.TestCase):
         self.assert_packet(original, matching["destination"][0], 3,
                            mac(far, 1), mac(destination, 0))
 
-    def test_udp(self):
+    def test_02_udp_forwarding(self):
         self.exchange(UDP(sport=21001, dport=31001))
         self.exchange(UDP(sport=21002, dport=31002, chksum=0))
 
-    def test_tcp(self):
+    def test_01_tcp_forwarding(self):
         self.exchange(TCP(sport=22001, dport=32001, flags="RA", seq=1001, ack=2001))
 
-    def test_icmp(self):
+    def test_00_icmp_forwarding(self):
         self.exchange(ICMP(type=8, id=41, seq=7))
 
     def test_reverse(self):
@@ -126,8 +137,8 @@ class ForwardingTests(unittest.TestCase):
         try:
             self.diamond.configure(1, static_path=1)
             self.diamond.configure(4, static_path=1)
-            self.exchange(UDP(sport=23001, dport=33001), lower=True)
-            self.exchange(UDP(sport=33001, dport=23001), reverse=True, lower=True)
+            self.exchange(ICMP(type=8, id=42, seq=1), lower=True)
+            self.exchange(ICMP(type=8, id=43, seq=1), reverse=True, lower=True)
         finally:
             self.diamond.configure(1)
             self.diamond.configure(4)
@@ -139,6 +150,103 @@ class ForwardingTests(unittest.TestCase):
     def test_verify_only(self):
         for device in range(1, 5):
             self.assertIn("verified", self.diamond.configure(device, verify_only=True))
+        self.diamond.timeout_us += 1
+        try:
+            with self.assertRaisesRegex(RuntimeError, "readback differs"):
+                self.diamond.configure(1, verify_only=True)
+        finally:
+            self.diamond.timeout_us -= 1
+        self.assertIn("verified", self.diamond.configure(1, verify_only=True))
+
+    def flowlet_sequence(self, protocol):
+        flow = path_change_flow(protocol)
+        registers = Registers(1)
+        registers.reset()
+        Registers(4).reset()
+        timeout = self.diamond.timeout_us / 1_000_000
+        net = self.diamond.net
+        interfaces = {
+            "upper": ("s1-eth2", None), "lower": ("s1-eth3", None),
+            "upper_exit": ("s2-eth2", None), "lower_exit": ("s3-eth2", None),
+            "destination": ("h2-eth0", net["h2"]),
+        }
+        records = []
+
+        def resident(flowlet_id):
+            state = registers.read(flow.index())
+            self.assertEqual(state["flow_valid"], 1)
+            self.assertEqual(state["flow_fingerprint"], flow.fingerprint())
+            self.assertEqual(state["flowlet_id"], flowlet_id)
+            self.assertEqual(state["flow_path"], flow.path(flowlet_id))
+            return state
+
+        def wait_gap(last_send, gap):
+            remaining = last_send + gap - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+
+        with Capture(interfaces) as capture, packet_socket("h1-eth0", net["h1"]) as sender:
+            def burst(count, flowlet_id, zero_checksum=False):
+                for _ in range(count):
+                    number = len(records)
+                    token = f"flowlet:{protocol}:{number:04d}|".encode()
+                    transport = (TCP(sport=flow.sport, dport=flow.dport, flags="RA",
+                                     seq=1000 + number, ack=2000) if protocol == 6 else
+                                 UDP(sport=flow.sport, dport=flow.dport,
+                                     chksum=0 if zero_checksum else None))
+                    frame = Ether(bytes(Ether(src=mac("h1", 0), dst=mac("s1", 1)) /
+                                        IP(src=flow.src, dst=flow.dst, ttl=64, id=number) /
+                                        transport / Raw(token)))
+                    sender.send(bytes(frame))
+                    last_send = time.monotonic()
+                    records.append((frame, token, flow.path(flowlet_id)))
+                    if _ + 1 < count:
+                        time.sleep(0.002)
+                capture.wait_for(token)
+                return last_send
+
+            last_send = burst(20, 0)
+            first = resident(0)
+            wait_gap(last_send, timeout / 2)
+            self.assertLess(time.monotonic() - last_send, timeout * 0.8,
+                            "short-gap scheduling budget exceeded")
+            last_send = burst(5, 0, zero_checksum=True)
+            continuation = resident(0)
+            elapsed = (continuation["flow_last_seen"] - first["flow_last_seen"]) & TIMESTAMP_MASK
+            self.assertGreater(elapsed, 0)
+            self.assertLess(elapsed, self.diamond.timeout_us)
+
+            wait_gap(last_send, timeout + 0.15)
+            burst(1, 1)
+            second = resident(1)
+            self.assertNotEqual(second["flow_path"], first["flow_path"])
+            self.assertGreater((second["flow_last_seen"] - continuation["flow_last_seen"]) &
+                               TIMESTAMP_MASK, self.diamond.timeout_us)
+            last_send = burst(19, 1)
+            sticky = resident(1)
+            self.assertEqual(sticky["flow_path"], second["flow_path"])
+            self.assertGreater((sticky["flow_last_seen"] - second["flow_last_seen"]) & TIMESTAMP_MASK, 0)
+
+            wait_gap(last_send, timeout + 0.15)
+            burst(5, 2)
+            third = resident(2)
+            self.assertEqual(third["flow_path"], second["flow_path"])
+            captured = capture.collect()
+
+        for frame, token, path in records:
+            self.assert_path(frame, token, captured, lower=bool(path))
+        for location in ("upper", "lower", "destination"):
+            wanted = [token for _, token, path in records if location == "destination" or
+                      location == ("lower" if path else "upper")]
+            observed = [token for packet in captured[location] for _, token, _ in records
+                        if token in bytes(packet)]
+            self.assertEqual(observed, wanted, f"packet order at {location}")
+
+    def test_flowlet_udp(self):
+        self.flowlet_sequence(17)
+
+    def test_flowlet_tcp(self):
+        self.flowlet_sequence(6)
 
     def test_ipv4_drops(self):
         net = self.diamond.net
