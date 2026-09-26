@@ -113,7 +113,7 @@ Reverse flowlets run on s4 while established forward state on s1 remains unchang
 
 Bypass and drop tests run in both directions with empty and populated state, comparing all five arrays on all four switches. ICMP, other IPv4 protocols, and TCP/UDP first and non-first fragments must preserve state. Invalid IPv4 checksums, TTL expiry, unsupported IHL, route misses, truncated headers, and inconsistent IPv4/TCP/UDP lengths must drop without changing state. Captures also verify TCP options and binary payloads; fragmented transport checksums are checked after reassembly.
 
-The suite also covers ordinary forward/reverse routing, both static branches, ping, live verification, and cleanup after successful operation or controller failure. `make clean` removes build products and local Python caches.
+The suite also covers ordinary forward/reverse routing, both static branches, ping, live verification, and cleanup after successful operation, controller failure, or SIGTERM at the interactive CLI. `make clean` removes build products and local Python caches.
 
 This is a reference implementation, not a production fabric load balancer. State is bounded, direct-mapped, and subject to eviction and fingerprint aliases. This is not congestion-aware load balancing: path selection has no queue, utilization, failure, or ordering feedback. A time gap alone does not guarantee that packets from successive flowlets cannot reorder in a congested network.
 

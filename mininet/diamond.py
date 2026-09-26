@@ -188,7 +188,8 @@ class Diamond:
 
 def main():
     def interrupted(signum, frame):
-        raise KeyboardInterrupt
+        # Mininet's CLI catches KeyboardInterrupt and resumes its command loop.
+        raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, interrupted)
     setLogLevel("info")

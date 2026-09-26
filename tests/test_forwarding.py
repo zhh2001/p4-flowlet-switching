@@ -1,8 +1,10 @@
 from contextlib import redirect_stdout
 import io
+import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import time
 import unittest
@@ -24,13 +26,10 @@ def wait_gap(last_send, gap):
         time.sleep(remaining)
 
 
-def assert_clean(test, diamond):
-    test.assertFalse(diamond.runtime.exists())
-    for switch in diamond.switches:
-        if switch.process is not None:
-            test.assertIsNotNone(switch.process.poll())
-    for pid in diamond.shell_pids:
-        test.assertFalse(Path(f"/proc/{pid}").exists(), f"remaining shell {pid}")
+def assert_clean(test, runtime, pids):
+    test.assertFalse(runtime.exists())
+    for pid in pids:
+        test.assertFalse(Path(f"/proc/{pid}").exists(), f"remaining process {pid}")
     for interface in INTERFACES:
         test.assertFalse(Path("/sys/class/net", interface).exists(), interface)
     for port in PORTS:
@@ -45,7 +44,29 @@ class CleanupTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "controller:.*absent.json"):
                 diamond.start()
-        assert_clean(self, diamond)
+        assert_clean(self, diamond.runtime, diamond.shell_pids +
+                     [switch.process.pid for switch in diamond.switches if switch.process is not None])
+
+    def test_cli_termination(self):
+        commands = (
+            "py 'resources=' + __import__('json').dumps({'runtime': str(net.switches[0].runtime), "
+            "'pids': [s.process.pid for s in net.switches] + [n.pid for n in net.hosts + net.switches]})\n"
+            "py __import__('os').kill(__import__('os').getpid(), __import__('signal').SIGTERM)\n"
+        )
+        with subprocess.Popen([sys.executable, "-u", str(ROOT / "mininet/diamond.py")],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True) as process:
+            try:
+                output, _ = process.communicate(commands, timeout=30)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                process.communicate(timeout=10)
+                raise
+        self.assertEqual(process.returncode, 143, output)
+        resources = next(line.split("resources=", 1)[1] for line in output.splitlines()
+                         if "resources=" in line)
+        resources = json.loads(resources)
+        assert_clean(self, Path(resources["runtime"]), resources["pids"])
 
 
 class ForwardingTests(unittest.TestCase):
@@ -61,7 +82,8 @@ class ForwardingTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.diamond.close()
-        assert_clean(cls(), cls.diamond)
+        assert_clean(cls(), cls.diamond.runtime, cls.diamond.shell_pids +
+                     [switch.process.pid for switch in cls.diamond.switches if switch.process is not None])
 
     def assert_packet(self, original, actual, hops, source_mac, destination_mac):
         expected = original.copy()
