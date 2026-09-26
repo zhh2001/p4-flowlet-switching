@@ -37,13 +37,30 @@ class Flow:
         key = self.key()
         return zlib.crc32(key[:8] + struct.pack("!I", flowlet_id) + key[8:]) % 2
 
+    def reverse(self):
+        return Flow(self.dst, self.src, self.protocol, self.dport, self.sport)
 
-def path_change_flow(protocol):
+
+def path_change_flow(protocol, reverse=False):
     for sport in range(20000, 20256):
         flow = Flow(protocol=protocol, sport=sport)
+        if reverse:
+            flow = flow.reverse()
         if flow.path(0) == 0 and flow.path(1) == 1:
             return flow
     raise AssertionError("no path-change tuple in the 256-candidate search")
+
+
+def collision_flows():
+    residents = {}
+    for sport in range(10000, 10000 + STATE_SIZE + 1):
+        flow = Flow(sport=sport)
+        resident = residents.get(flow.index())
+        if (resident is not None and resident.fingerprint() != flow.fingerprint() and
+                resident.path(0) == flow.path(0)):
+            return resident, flow
+        residents[flow.index()] = flow
+    raise AssertionError("no suitable collision in the 4097-candidate search")
 
 
 class Registers:

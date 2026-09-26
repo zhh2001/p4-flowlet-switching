@@ -15,7 +15,13 @@ sys.path.insert(0, str(ROOT / "mininet"))
 from diamond import Diamond, INTERFACES, PORTS, mac, checked
 from mininet.log import setLogLevel
 from packets import Capture, packet_socket
-from state import Flow, Registers, TIMESTAMP_MASK, path_change_flow
+from state import Flow, Registers, TIMESTAMP_MASK, collision_flows, path_change_flow
+
+
+def wait_gap(last_send, gap):
+    remaining = last_send + gap - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def assert_clean(test, diamond):
@@ -74,8 +80,8 @@ class ForwardingTests(unittest.TestCase):
 
     def exchange(self, transport, reverse=False, lower=False):
         net = self.diamond.net
-        source, destination = ("h2", "h1") if reverse else ("h1", "h2")
-        edge, far = ("s4", "s1") if reverse else ("s1", "s4")
+        source = "h2" if reverse else "h1"
+        edge = "s4" if reverse else "s1"
         source_ip, destination_ip = (("10.0.4.1", "10.0.1.1") if reverse
                                      else ("10.0.1.1", "10.0.4.1"))
         token = f"forwarding:{self.id()}:{reverse}:{lower}:{bytes(transport).hex()}".encode()
@@ -85,18 +91,56 @@ class ForwardingTests(unittest.TestCase):
         if TCP in original or UDP in original:
             lower = bool(Flow(source_ip, destination_ip, original[IP].proto,
                               transport.sport, transport.dport).path(0))
+        with Capture(self.interfaces(reverse)) as capture, packet_socket(f"{source}-eth0", net[source]) as sender:
+            sender.send(bytes(original))
+            captured = capture.collect()
+        self.assert_path(original, token, captured, reverse, lower)
+
+    def interfaces(self, reverse=False):
+        edge, destination = ("s4", "h1") if reverse else ("s1", "h2")
         branch_port = 1 if reverse else 2
-        interfaces = {
+        return {
             "upper": (f"{edge}-eth2", None),
             "lower": (f"{edge}-eth3", None),
             "upper_exit": (f"s2-eth{branch_port}", None),
             "lower_exit": (f"s3-eth{branch_port}", None),
-            "destination": (f"{destination}-eth0", net[destination]),
+            "destination": (f"{destination}-eth0", self.diamond.net[destination]),
         }
-        with Capture(interfaces) as capture, packet_socket(f"{source}-eth0", net[source]) as sender:
-            sender.send(bytes(original))
-            captured = capture.collect()
-        self.assert_path(original, token, captured, reverse, lower)
+
+    def send_flow(self, sender, capture, records, flow, flowlet_id, zero_checksum=False):
+        number = len(records)
+        token = f"{self.id()}:{flow.key().hex()}:{number:04d}|".encode()
+        source, edge = ("h2", "s4") if flow.src == "10.0.4.1" else ("h1", "s1")
+        transport = (TCP(sport=flow.sport, dport=flow.dport, flags="RA",
+                         seq=1000 + number, ack=2000) if flow.protocol == 6 else
+                     UDP(sport=flow.sport, dport=flow.dport,
+                         chksum=0 if zero_checksum else None))
+        frame = Ether(bytes(Ether(src=mac(source, 0), dst=mac(edge, 1)) /
+                            IP(src=flow.src, dst=flow.dst, ttl=64, id=number) /
+                            transport / Raw(token)))
+        sender.send(bytes(frame))
+        last_send = time.monotonic()
+        records.append((frame, token, flow.path(flowlet_id)))
+        capture.wait_for(token)
+        return last_send
+
+    def assert_resident(self, registers, flow, flowlet_id):
+        state = registers.read(flow.index())
+        self.assertEqual(state["flow_valid"], 1)
+        self.assertEqual(state["flow_fingerprint"], flow.fingerprint())
+        self.assertEqual(state["flowlet_id"], flowlet_id)
+        self.assertEqual(state["flow_path"], flow.path(flowlet_id))
+        return state
+
+    def assert_records(self, records, captured, reverse=False):
+        for frame, token, path in records:
+            self.assert_path(frame, token, captured, reverse, lower=bool(path))
+        for location in ("upper", "lower", "destination"):
+            wanted = [token for _, token, path in records if location == "destination" or
+                      location == ("lower" if path else "upper")]
+            observed = [token for packet in captured[location] for _, token, _ in records
+                        if token in bytes(packet)]
+            self.assertEqual(observed, wanted, f"packet order at {location}")
 
     def assert_path(self, original, token, captured, reverse=False, lower=False):
         destination = "h1" if reverse else "h2"
@@ -158,95 +202,165 @@ class ForwardingTests(unittest.TestCase):
             self.diamond.timeout_us -= 1
         self.assertIn("verified", self.diamond.configure(1, verify_only=True))
 
-    def flowlet_sequence(self, protocol):
-        flow = path_change_flow(protocol)
-        registers = Registers(1)
+    def flowlet_sequence(self, protocol, reverse=False):
+        flow = path_change_flow(protocol, reverse)
+        registers = Registers(4 if reverse else 1)
+        other = Registers(1 if reverse else 4)
         registers.reset()
-        Registers(4).reset()
+        other.reset()
         timeout = self.diamond.timeout_us / 1_000_000
         net = self.diamond.net
-        interfaces = {
-            "upper": ("s1-eth2", None), "lower": ("s1-eth3", None),
-            "upper_exit": ("s2-eth2", None), "lower_exit": ("s3-eth2", None),
-            "destination": ("h2-eth0", net["h2"]),
-        }
+        if reverse:
+            forward = flow.reverse()
+            self.assertNotEqual(forward.key(), flow.key())
+            records = []
+            with Capture(self.interfaces()) as capture, packet_socket("h1-eth0", net["h1"]) as sender:
+                last_send = self.send_flow(sender, capture, records, forward, 0)
+                self.assert_resident(other, forward, 0)
+                wait_gap(last_send, timeout + 0.15)
+                self.send_flow(sender, capture, records, forward, 1)
+                self.assert_resident(other, forward, 1)
+                self.assert_records(records, capture.collect())
+            self.assertFalse(any(any(values) for values in registers.read().values()))
+        other_state = other.read()
         records = []
+        source = "h2" if reverse else "h1"
 
-        def resident(flowlet_id):
-            state = registers.read(flow.index())
-            self.assertEqual(state["flow_valid"], 1)
-            self.assertEqual(state["flow_fingerprint"], flow.fingerprint())
-            self.assertEqual(state["flowlet_id"], flowlet_id)
-            self.assertEqual(state["flow_path"], flow.path(flowlet_id))
-            return state
-
-        def wait_gap(last_send, gap):
-            remaining = last_send + gap - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
-
-        with Capture(interfaces) as capture, packet_socket("h1-eth0", net["h1"]) as sender:
+        with Capture(self.interfaces(reverse)) as capture, packet_socket(f"{source}-eth0", net[source]) as sender:
             def burst(count, flowlet_id, zero_checksum=False):
                 for _ in range(count):
-                    number = len(records)
-                    token = f"flowlet:{protocol}:{number:04d}|".encode()
-                    transport = (TCP(sport=flow.sport, dport=flow.dport, flags="RA",
-                                     seq=1000 + number, ack=2000) if protocol == 6 else
-                                 UDP(sport=flow.sport, dport=flow.dport,
-                                     chksum=0 if zero_checksum else None))
-                    frame = Ether(bytes(Ether(src=mac("h1", 0), dst=mac("s1", 1)) /
-                                        IP(src=flow.src, dst=flow.dst, ttl=64, id=number) /
-                                        transport / Raw(token)))
-                    sender.send(bytes(frame))
-                    last_send = time.monotonic()
-                    records.append((frame, token, flow.path(flowlet_id)))
+                    last_send = self.send_flow(sender, capture, records, flow, flowlet_id, zero_checksum)
                     if _ + 1 < count:
                         time.sleep(0.002)
-                capture.wait_for(token)
                 return last_send
 
             last_send = burst(20, 0)
-            first = resident(0)
+            first = self.assert_resident(registers, flow, 0)
             wait_gap(last_send, timeout / 2)
             self.assertLess(time.monotonic() - last_send, timeout * 0.8,
                             "short-gap scheduling budget exceeded")
             last_send = burst(5, 0, zero_checksum=True)
-            continuation = resident(0)
+            continuation = self.assert_resident(registers, flow, 0)
             elapsed = (continuation["flow_last_seen"] - first["flow_last_seen"]) & TIMESTAMP_MASK
             self.assertGreater(elapsed, 0)
             self.assertLess(elapsed, self.diamond.timeout_us)
 
             wait_gap(last_send, timeout + 0.15)
             burst(1, 1)
-            second = resident(1)
+            second = self.assert_resident(registers, flow, 1)
             self.assertNotEqual(second["flow_path"], first["flow_path"])
             self.assertGreater((second["flow_last_seen"] - continuation["flow_last_seen"]) &
                                TIMESTAMP_MASK, self.diamond.timeout_us)
             last_send = burst(19, 1)
-            sticky = resident(1)
+            sticky = self.assert_resident(registers, flow, 1)
             self.assertEqual(sticky["flow_path"], second["flow_path"])
             self.assertGreater((sticky["flow_last_seen"] - second["flow_last_seen"]) & TIMESTAMP_MASK, 0)
 
             wait_gap(last_send, timeout + 0.15)
             burst(5, 2)
-            third = resident(2)
+            third = self.assert_resident(registers, flow, 2)
             self.assertEqual(third["flow_path"], second["flow_path"])
             captured = capture.collect()
 
-        for frame, token, path in records:
-            self.assert_path(frame, token, captured, lower=bool(path))
-        for location in ("upper", "lower", "destination"):
-            wanted = [token for _, token, path in records if location == "destination" or
-                      location == ("lower" if path else "upper")]
-            observed = [token for packet in captured[location] for _, token, _ in records
-                        if token in bytes(packet)]
-            self.assertEqual(observed, wanted, f"packet order at {location}")
+        self.assert_records(records, captured, reverse)
+        self.assertEqual(other.read(), other_state, "traffic changed the opposite edge's state")
+        for device in (2, 3):
+            self.assertFalse(any(any(values) for values in Registers(device).read().values()),
+                             f"transit switch s{device} recorded flowlet state")
 
     def test_flowlet_udp(self):
         self.flowlet_sequence(17)
 
     def test_flowlet_tcp(self):
         self.flowlet_sequence(6)
+
+    def test_flowlet_reverse(self):
+        self.flowlet_sequence(17, reverse=True)
+
+    def test_flow_independence(self):
+        a = path_change_flow(17)
+        b = Flow(a.src, a.dst, 6, a.sport, a.dport)
+        self.assertNotEqual(a.index(), b.index())
+        registers = Registers(1)
+        registers.reset()
+        timeout = self.diamond.timeout_us / 1_000_000
+        records = []
+        with Capture(self.interfaces()) as capture, packet_socket("h1-eth0", self.diamond.net["h1"]) as sender:
+            last_a = self.send_flow(sender, capture, records, a, 0)
+            first_a = self.assert_resident(registers, a, 0)
+            last_b = self.send_flow(sender, capture, records, b, 0)
+            first_b = self.assert_resident(registers, b, 0)
+
+            # Keep B active while A's inter-packet gap exceeds the timeout.
+            for gap in (timeout * 0.4, timeout * 0.8, timeout + 0.15):
+                wait_gap(last_a, gap)
+                self.assertLess(time.monotonic() - last_b, timeout * 0.8,
+                                "keepalive scheduling budget exceeded")
+                last_b = self.send_flow(sender, capture, records, b, 0)
+            active_b = self.assert_resident(registers, b, 0)
+            self.assertGreater((active_b["flow_last_seen"] - first_b["flow_last_seen"]) &
+                               TIMESTAMP_MASK, 0)
+
+            self.send_flow(sender, capture, records, a, 1)
+            second_a = self.assert_resident(registers, a, 1)
+            self.assertGreater((second_a["flow_last_seen"] - first_a["flow_last_seen"]) &
+                               TIMESTAMP_MASK, self.diamond.timeout_us)
+            self.assertEqual(registers.read(b.index()), active_b)
+            self.assertLess(time.monotonic() - last_b, timeout * 0.8,
+                            "final continuation scheduling budget exceeded")
+            self.send_flow(sender, capture, records, b, 0)
+            final_b = self.assert_resident(registers, b, 0)
+            elapsed = (final_b["flow_last_seen"] - active_b["flow_last_seen"]) & TIMESTAMP_MASK
+            self.assertGreater(elapsed, 0)
+            self.assertLess(elapsed, self.diamond.timeout_us)
+            self.assertEqual(registers.read(a.index()), second_a)
+            captured = capture.collect()
+        self.assert_records(records, captured)
+        valid = registers.read()["flow_valid"]
+        self.assertEqual([index for index, value in enumerate(valid) if value],
+                         sorted((a.index(), b.index())))
+
+    def test_collision_eviction(self):
+        a, b = collision_flows()
+        self.assertEqual(a.index(), b.index())
+        self.assertNotEqual(a.fingerprint(), b.fingerprint())
+        registers = Registers(1)
+        registers.reset()
+        timeout = self.diamond.timeout_us / 1_000_000
+        records = []
+        with Capture(self.interfaces()) as capture, packet_socket("h1-eth0", self.diamond.net["h1"]) as sender:
+            last_send = self.send_flow(sender, capture, records, a, 0)
+            self.assert_resident(registers, a, 0)
+            wait_gap(last_send, timeout + 0.15)
+            last_send = self.send_flow(sender, capture, records, a, 1)
+            resident_a = self.assert_resident(registers, a, 1)
+
+            self.assertLess(time.monotonic() - last_send, timeout * 0.8)
+            last_send = self.send_flow(sender, capture, records, b, 0)
+            fresh_b = self.assert_resident(registers, b, 0)
+            self.assertNotEqual(fresh_b["flow_path"], resident_a["flow_path"])
+            elapsed = (fresh_b["flow_last_seen"] - resident_a["flow_last_seen"]) & TIMESTAMP_MASK
+            self.assertGreater(elapsed, 0)
+            self.assertLess(elapsed, self.diamond.timeout_us)
+
+            wait_gap(last_send, timeout + 0.15)
+            last_send = self.send_flow(sender, capture, records, b, 1)
+            resident_b = self.assert_resident(registers, b, 1)
+            self.assertLess(time.monotonic() - last_send, timeout * 0.8)
+            self.send_flow(sender, capture, records, a, 0)
+            fresh_a = self.assert_resident(registers, a, 0)
+            self.assertNotEqual(fresh_a["flow_path"], resident_b["flow_path"])
+            elapsed = (fresh_a["flow_last_seen"] - resident_b["flow_last_seen"]) & TIMESTAMP_MASK
+            self.assertGreater(elapsed, 0)
+            self.assertLess(elapsed, self.diamond.timeout_us)
+            self.send_flow(sender, capture, records, a, 0)
+            final_a = self.assert_resident(registers, a, 0)
+            captured = capture.collect()
+        self.assert_records(records, captured)
+        for field, values in registers.read().items():
+            self.assertEqual(values[a.index()], final_a[field])
+            self.assertFalse(any(value for index, value in enumerate(values) if index != a.index()),
+                             f"collision changed another slot in {field}")
 
     def test_ipv4_drops(self):
         net = self.diamond.net
